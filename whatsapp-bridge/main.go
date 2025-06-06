@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -30,6 +31,24 @@ import (
 	waLog "go.mau.fi/whatsmeow/util/log"
 	"google.golang.org/protobuf/proto"
 )
+
+// Configuration constants
+const (
+	// Default number of days of message history to sync
+	DEFAULT_HISTORY_DAYS_LIMIT = 30
+)
+
+// getHistoryDaysLimit reads the HISTORY_DAYS_LIMIT environment variable
+// and returns it as an integer, with fallback to the default value
+func getHistoryDaysLimit() int {
+	if envValue := os.Getenv("HISTORY_DAYS_LIMIT"); envValue != "" {
+		if days, err := strconv.Atoi(envValue); err == nil && days > 0 {
+			return days
+		}
+		fmt.Printf("Warning: Invalid HISTORY_DAYS_LIMIT value '%s', using default %d\n", envValue, DEFAULT_HISTORY_DAYS_LIMIT)
+	}
+	return DEFAULT_HISTORY_DAYS_LIMIT
+}
 
 // Message represents a chat message for our client
 type Message struct {
@@ -1009,7 +1028,15 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, historySync *events.HistorySync, logger waLog.Logger) {
 	fmt.Printf("Received history sync event with %d conversations\n", len(historySync.Data.Conversations))
 
+	// Get the configured history days limit
+	historyDaysLimit := getHistoryDaysLimit()
+	
+	// Calculate the cutoff time for historyDaysLimit days ago
+	cutoffDate := time.Now().AddDate(0, 0, -historyDaysLimit)
+	fmt.Printf("Filtering messages newer than %s (%d days)\n", cutoffDate.Format("2006-01-02 15:04:05"), historyDaysLimit)
+
 	syncedCount := 0
+	skippedCount := 0
 	for _, conversation := range historySync.Data.Conversations {
 		// Parse JID from the conversation
 		if conversation.ID == nil {
@@ -1112,6 +1139,13 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					continue
 				}
 
+				// Skip messages older than historyDaysLimit days
+				if timestamp.Before(cutoffDate) {
+					skippedCount++
+					logger.Debugf("Skipping message older than %d days: %s", historyDaysLimit, timestamp.Format("2006-01-02 15:04:05"))
+					continue
+				}
+
 				err = messageStore.StoreMessage(
 					msgID,
 					chatJID,
@@ -1144,7 +1178,7 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 		}
 	}
 
-	fmt.Printf("History sync complete. Stored %d messages.\n", syncedCount)
+	fmt.Printf("History sync complete. Stored %d messages, skipped %d messages older than %d days.\n", syncedCount, skippedCount, HISTORY_DAYS_LIMIT)
 }
 
 // Request history sync from the server
@@ -1164,7 +1198,14 @@ func requestHistorySync(client *whatsmeow.Client) {
 		return
 	}
 
-	// Build and send a history sync request
+	// Get the configured history days limit
+	historyDaysLimit := getHistoryDaysLimit()
+	
+	// Calculate the timestamp for historyDaysLimit days ago
+	cutoffDate := time.Now().AddDate(0, 0, -historyDaysLimit)
+	fromTimestamp := uint64(cutoffDate.Unix())
+
+	// Build and send a history sync request limited to last historyDaysLimit days
 	historyMsg := client.BuildHistorySyncRequest(nil, 100)
 	if historyMsg == nil {
 		fmt.Println("Failed to build history sync request.")
@@ -1179,7 +1220,8 @@ func requestHistorySync(client *whatsmeow.Client) {
 	if err != nil {
 		fmt.Printf("Failed to request history sync: %v\n", err)
 	} else {
-		fmt.Println("History sync requested. Waiting for server response...")
+		fmt.Printf("History sync requested for last %d days (from %s). Waiting for server response...\n", 
+			historyDaysLimit, cutoffDate.Format("2006-01-02 15:04:05"))
 	}
 }
 
